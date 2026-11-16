@@ -9,7 +9,6 @@ Async client for server.py: fires several prompts concurrently and prints each s
 import argparse
 import asyncio
 import json
-import time
 
 import aiohttp
 
@@ -25,9 +24,8 @@ DEFAULT_PROMPTS = [
 ]
 
 
-async def run_one(session, url, i, prompt, verbose):
-    t0 = time.perf_counter()
-    ttft, pieces, n = None, [], 0
+async def send_prompt(session, url, i, prompt, verbose):
+    pieces, n = [], 0
     async with session.post(url, json={"prompt": prompt}) as resp:
         if resp.status != 200:
             return dict(i=i, prompt=prompt, error=f"HTTP {resp.status}: {await resp.text()}")
@@ -37,14 +35,11 @@ async def run_one(session, url, i, prompt, verbose):
                 return dict(i=i, prompt=prompt, error=item["error"])
             if item.get("done"):
                 break
-            if ttft is None:
-                ttft = time.perf_counter() - t0
             n += 1
             pieces.append(item["text"])
             if verbose:
                 print(f"[req {i}] {item['text']!r}", flush=True)
-    total = time.perf_counter() - t0
-    return dict(i=i, prompt=prompt, text="".join(pieces), ttft=ttft, total=total, n=n)
+    return dict(i=i, prompt=prompt, text="".join(pieces), n=n)
 
 
 async def main():
@@ -59,7 +54,7 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=None) # the server may hold a request until its batch fills
     async with aiohttp.ClientSession(timeout=timeout) as session:
         results = await asyncio.gather(*(
-            run_one(session, args.url, i, pr, not args.quiet) for i, pr in enumerate(prompts)
+            send_prompt(session, args.url, i, pr, not args.quiet) for i, pr in enumerate(prompts)
         ))
 
     print("\n" + "=" * 80)
@@ -67,8 +62,7 @@ async def main():
         if "error" in r:
             print(f"[req {r['i']}] ERROR: {r['error']}")
             continue
-        tpot = (r["total"] - r["ttft"]) / (r["n"] - 1) if r["n"] > 1 else float("nan")
-        print(f"[req {r['i']}] ttft={r['ttft']*1000:.1f}ms tpot={tpot*1000:.1f}ms tokens={r['n']}")
+        print(f"[req {r['i']}] tokens={r['n']}")
         print(f"  {r['prompt']}\033[1m{r['text']}\033[0m\n")
 
 

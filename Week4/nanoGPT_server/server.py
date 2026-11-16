@@ -95,7 +95,7 @@ class BatchWorker(threading.Thread):
             ids = idx_next[:, 0].tolist() # idx_next is tensor stored on GPU, so make copy on CPU
             for r, dec, tid in zip(batch, decoders, ids):
                 r.emit({"token_id": tid, "text": dec.push(tid)})
-                if step == steps - 1:
+                if step == steps - 1: # if we have generated MAX_NEW_TOKENS tokens already
                     r.emit({"done": True, "num_tokens": steps})
 
         generate(self.model, idx, steps, temperature=config.TEMPERATURE, top_k=config.TOP_K,
