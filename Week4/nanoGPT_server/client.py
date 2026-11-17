@@ -29,11 +29,11 @@ async def send_prompt(session, url, i, prompt, verbose):
     async with session.post(url, json={"prompt": prompt}) as resp:
         if resp.status != 200:
             return dict(i=i, prompt=prompt, error=f"HTTP {resp.status}: {await resp.text()}")
-        async for line in resp.content: # one JSON object per line
+        async for line in resp.content: # runs until resp.write_eof() is called
             item = json.loads(line)
             if "error" in item:
                 return dict(i=i, prompt=prompt, error=item["error"])
-            if item.get("done"):
+            if item.get("done"): # sent when MAX_NEW_TOKENS have been genereated or when model generates EOS token
                 break
             n += 1
             pieces.append(item["text"])

@@ -5,6 +5,7 @@ HOST = "127.0.0.1"
 PORT = 8000
 
 # model
+MODEL_TYPE = "gpt2"  # which runner in runners.py to use
 MODEL = "gpt2"   # one of: gpt2, gpt2-medium, gpt2-large, gpt2-xl
 DEVICE = None    # None = auto-pick cuda > mps > cpu; or set "cuda", "mps", "cpu"
 

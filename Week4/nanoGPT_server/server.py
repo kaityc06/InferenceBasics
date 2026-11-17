@@ -7,11 +7,9 @@ from dataclasses import dataclass, field
 
 import torch
 from aiohttp import web
-from transformers import GPT2TokenizerFast
 
 import config
-from generate import generate
-from model import GPT
+from runners import make_runner
 
 _SENTINEL = object() # pushed onto the request queue to stop the worker
 
@@ -26,25 +24,10 @@ class GenRequest:
     def emit(self, item):
         self.loop.call_soon_threadsafe(self.out.put_nowait, item)
 
-# one UTF-8 character can span multiple tokens (i.e. an emoji), so this holds back tokens until they decode to complete text
-class IncrementalDecoder:
-    def __init__(self, tokenizer):
-        self.tok = tokenizer
-        self.pending = [] # tokens whose text hasn't been emitted yet
-
-    def push(self, token_id):
-        self.pending.append(token_id)
-        text = self.tok.decode(self.pending)
-        if text.endswith("�") and len(self.pending) < MAX_PENDING: # incomplete character, so wait for the next token
-            return ""
-        self.pending = []
-        return text
-
-
 class BatchWorker(threading.Thread):
-    def __init__(self, model, tokenizer, device):
+    def __init__(self, runner):
         super().__init__(daemon=True, name="batch-worker")
-        self.model, self.tok, self.device = model, tokenizer, device
+        self.runner = runner
         self.requests = queue.Queue()
 
     def submit(self, req):
@@ -74,33 +57,26 @@ class BatchWorker(threading.Thread):
             batch.append(req)
         return batch
 
-    def _left_pad(self, batch):
-        T = max(len(r.prompt_ids) for r in batch)
-        pad_id = self.tok.eos_token_id
-        idx = torch.full((len(batch), T), pad_id, dtype=torch.long)
-        mask = torch.zeros((len(batch), T), dtype=torch.long)
-        for row, r in enumerate(batch):
-            n = len(r.prompt_ids)
-            idx[row, T - n:] = torch.tensor(r.prompt_ids, dtype=torch.long)
-            mask[row, T - n:] = 1
-        return idx.to(self.device), mask.to(self.device)
-
     def _run_batch(self, batch):
-        idx, mask = self._left_pad(batch)
-        steps = config.MAX_NEW_TOKENS
-        decoders = [IncrementalDecoder(self.tok) for _ in batch] # each request gets a separate IncrementalDecoder
+        states = [self.runner.new_state(r.prompt_ids, config.MAX_NEW_TOKENS) for r in batch] # one state per request
+        active = list(zip(batch, states))
+        n_steps = 0
 
-        # model calls this for every generated batch of tokens
-        def on_token(step, idx_next):
-            ids = idx_next[:, 0].tolist() # idx_next is tensor stored on GPU, so make copy on CPU
-            for r, dec, tid in zip(batch, decoders, ids):
-                r.emit({"token_id": tid, "text": dec.push(tid)})
-                if step == steps - 1: # if we have generated MAX_NEW_TOKENS tokens already
-                    r.emit({"done": True, "num_tokens": steps})
+        outs = self.runner.prefill(states) # runs the prompts and samples each request's first token
+        while True:
+            for (r, s), out in zip(active, outs):
+                if out is not None: # None means the request sampled the EOS token, which isn't sent
+                    r.emit({"token_id": out.token_id, "text": out.text})
+                if s.finished: # reached EOS or MAX_NEW_TOKENS
+                    r.emit({"done": True, "num_tokens": len(s.output_ids)})
+            active = [(r, s) for r, s in active if not s.finished] # finished requests leave the batch
+            if not active:
+                break
+            outs = self.runner.step([s for _, s in active])
+            n_steps += 1
 
-        generate(self.model, idx, steps, temperature=config.TEMPERATURE, top_k=config.TOP_K,
-                 attention_mask=mask, token_callback=on_token)
-        print(f"[worker] batch={len(batch)} padded_prompt_len={idx.size(1)} new_tokens={steps}", flush=True)
+        print(f"[worker] batch={len(batch)} max_prompt_len={max(len(s.prompt_ids) for s in states)} "
+              f"steps={n_steps} num_tokens={[len(s.output_ids) for s in states]}", flush=True)
 
     def run(self):
         while True:
@@ -123,7 +99,7 @@ async def handle_generate(request: web.Request):
     except (json.JSONDecodeError, KeyError, TypeError):
         return web.json_response({"error": 'expected JSON {"prompt": str}'}, status=400)
 
-    prompt_ids = app["tokenizer"].encode(prompt) if isinstance(prompt, str) else []
+    prompt_ids = app["runner"].encode(prompt) if isinstance(prompt, str) else []
     if not prompt_ids:
         return web.json_response({"error": "prompt must be a non-empty string"}, status=400)
 
@@ -147,14 +123,14 @@ async def handle_generate(request: web.Request):
 def main():
     device = config.DEVICE or ("cuda" if torch.cuda.is_available()
                                else "mps" if torch.backends.mps.is_available() else "cpu")
-    tokenizer = GPT2TokenizerFast.from_pretrained(config.MODEL)
-    model = GPT.from_pretrained(config.MODEL).to(device).eval()
-    print(f"[server] model={config.MODEL} device={device} batch_size={config.BATCH_SIZE} max_wait={config.MAX_WAIT}")
+    runner = make_runner(config.MODEL_TYPE, config.MODEL, device,
+                         temperature=config.TEMPERATURE, top_k=config.TOP_K)
+    print(f"[server] model_type={config.MODEL_TYPE} model={config.MODEL} device={device} batch_size={config.BATCH_SIZE} max_wait={config.MAX_WAIT}")
 
-    worker = BatchWorker(model, tokenizer, device)
+    worker = BatchWorker(runner)
 
     app = web.Application()
-    app.update(model=model, tokenizer=tokenizer, worker=worker)
+    app.update(runner=runner, worker=worker)
     app.router.add_post("/generate", handle_generate)
 
     async def start_worker(app):

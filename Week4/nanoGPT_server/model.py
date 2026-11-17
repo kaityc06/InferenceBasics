@@ -1,14 +1,4 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
-
 import math
-import inspect
 from dataclasses import dataclass
 
 import torch
@@ -49,14 +39,9 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-        self.key_cache = []
-        self.value_cache = []
-
-    def reset_cache(self):
-        self.key_cache = []
-        self.value_cache = []
-
-    def forward(self, x, use_cache = False, key_padding_mask = None):
+    def forward(self, x, past_kv = None, key_padding_mask = None):
+        # past_kv: optional (k, v) cached from earlier calls, each (B, T_past, C). The layer doesn't store
+        #   any cache itself; it returns the updated (k, v) and the caller decides what to keep.
         # key_padding_mask: optional (B, T) bool, True = real token, False = pad.
         # T covers every key this call attends over (cached + new).
         B, T_temp, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -64,12 +49,12 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2) # each (B, T_temp, C)
-        if use_cache:
-          # append new k and v to KV cache, then attend over everything cached so far
-          self.key_cache.append(k)
-          self.value_cache.append(v)
-          k = torch.cat(self.key_cache, dim=1) # (B, T, C)
-          v = torch.cat(self.value_cache, dim=1) # (B, T, C)
+        if past_kv is not None:
+            # attend over the cached keys/values followed by the new ones
+            past_k, past_v = past_kv
+            k = torch.cat((past_k, k), dim=1) # (B, T, C)
+            v = torch.cat((past_v, v), dim=1) # (B, T, C)
+        present_kv = (k, v) # everything this layer has seen so far, for the caller to cache
 
         T = k.size(1) # total number of keys (cached + new)
 
@@ -111,7 +96,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y # (B, T_temp, C)
+        return y, present_kv # (B, T_temp, C), ((B, T, C), (B, T, C))
 
 class MLP(nn.Module):
 
@@ -138,10 +123,11 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, use_cache = False, key_padding_mask = None):
-        x = x + self.attn(self.ln_1(x), use_cache, key_padding_mask)
+    def forward(self, x, past_kv = None, key_padding_mask = None):
+        a, present_kv = self.attn(self.ln_1(x), past_kv, key_padding_mask)
+        x = x + a
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, present_kv
 
 @dataclass
 class GPTConfig:
@@ -206,19 +192,19 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def reset_cache(self):
-        for block in self.transformer.h:
-            block.attn.reset_cache()
-
-    def forward(self, idx, targets=None, use_cache = False, pos_value = 0, attention_mask = None):
-        # pos_value: position of the first token in idx (only used with use_cache and no attention_mask)
+    def forward(self, idx, targets=None, past_kv = None, attention_mask = None):
+        # past_kv: optional KV cache from an earlier call, a list with one (k, v) per layer, each (b, T_past, C).
+        #   Returned as present_kv with the new tokens appended; the model itself keeps no cache.
         # attention_mask: optional (b, T_kv) tensor, 1 = real token, 0 = left pad. T_kv covers every key
         #   attended over: the cached tokens followed by the t tokens in idx (so T_kv == t without cache).
         device = idx.device
         b, t = idx.size()
+        if past_kv is None:
+            past_kv = [None] * len(self.transformer.h)
         if attention_mask is None:
-            assert pos_value + t <= self.config.block_size, f"Cannot forward sequence of length {pos_value + t}, block size is only {self.config.block_size}"
-            pos = torch.arange(pos_value, pos_value + t, dtype=torch.long, device=device) # shape (t)
+            past_len = 0 if past_kv[0] is None else past_kv[0][0].size(1)
+            assert past_len + t <= self.config.block_size, f"Cannot forward sequence of length {past_len + t}, block size is only {self.config.block_size}"
+            pos = torch.arange(past_len, past_len + t, dtype=torch.long, device=device) # shape (t)
             key_padding_mask = None
         else:
             assert attention_mask.size(0) == b and attention_mask.size(1) >= t
@@ -232,8 +218,10 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd) or (b, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x, use_cache, key_padding_mask)
+        present_kv = []
+        for block, layer_past in zip(self.transformer.h, past_kv):
+            x, layer_present = block(x, layer_past, key_padding_mask)
+            present_kv.append(layer_present)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -245,18 +233,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
-
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+        return logits, loss, present_kv
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -314,45 +291,3 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
-        return optimizer
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
